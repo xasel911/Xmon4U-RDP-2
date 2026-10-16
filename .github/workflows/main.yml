@@ -1,0 +1,102 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    env:
+      RDP_USER: Xmon4U
+      RDP_PASS: "4725"
+
+    steps:
+      - name: Relax local password policy
+        shell: pwsh
+        run: |
+          $cfg = Join-Path $env:TEMP "secpol.cfg"
+          secedit /export /cfg $cfg | Out-Null
+          $content = Get-Content -Path $cfg -Encoding Unicode
+          $content = $content -replace 'PasswordComplexity\s*=\s*\d+', 'PasswordComplexity = 0'
+          $content = $content -replace 'MinimumPasswordLength\s*=\s*\d+', 'MinimumPasswordLength = 0'
+          Set-Content -Path $cfg -Value $content -Encoding Unicode
+          secedit /configure /db (Join-Path $env:windir "security\local.sdb") /cfg $cfg /areas SECURITYPOLICY | Out-Null
+          Remove-Item $cfg -Force
+          Write-Host "Password policy relaxed."
+
+      - name: Enable Remote Desktop and firewall
+        shell: pwsh
+        run: |
+          $ts  = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+          $tcp = "$ts\WinStations\RDP-Tcp"
+          Set-ItemProperty -Path $ts  -Name fDenyTSConnections -Value 0 -Force
+          Set-ItemProperty -Path $tcp -Name UserAuthentication -Value 0 -Force
+          Set-ItemProperty -Path $tcp -Name SecurityLayer      -Value 0 -Force
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          Remove-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound -Protocol TCP `
+            -LocalPort 3389 -Action Allow -RemoteAddress 100.64.0.0/10,fd7a:115c:a1e0::/48 | Out-Null
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP user
+        shell: pwsh
+        run: |
+          $pw = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+          New-LocalUser -Name $env:RDP_USER -Password $pw -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USER
+          if (-not (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue)) {
+            throw "User creation failed"
+          }
+          Write-Host "User '$env:RDP_USER' created."
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $msi = Join-Path $env:TEMP "tailscale.msi"
+          Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -Wait
+          Remove-Item $msi -Force
+
+      - name: Connect to Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          & $ts up --authkey=$env:TS_AUTHKEY --hostname="gh-runner-$env:GITHUB_RUN_ID"
+          if ($LASTEXITCODE -ne 0) { throw "tailscale up failed" }
+
+          $ip = ""
+          for ($i = 0; $i -lt 12 -and -not $ip; $i++) {
+            Start-Sleep -Seconds 5
+            $ip = "$(& $ts ip -4 | Select-Object -First 1)".Trim()
+          }
+          if (-not $ip) { throw "Tailscale IP not assigned" }
+
+          Write-Host "Tailscale IP: $ip"
+          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify RDP port
+        shell: pwsh
+        run: |
+          $ok = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
+          if (-not $ok) { throw "RDP port 3389 not reachable on Tailscale IP" }
+          Write-Host "RDP port is reachable."
+
+      - name: Keep session alive
+        shell: pwsh
+        run: |
+          Write-Host "=============================="
+          Write-Host "Address  : $env:TAILSCALE_IP"
+          Write-Host "Username : $env:RDP_USER"
+          Write-Host "=============================="
+          while ($true) {
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active"
+            Start-Sleep -Seconds 300
+          }
